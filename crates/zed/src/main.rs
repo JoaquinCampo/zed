@@ -785,6 +785,7 @@ fn main() {
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
         git_ui::init(cx);
+        external_review::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         tabular_data_preview::init(cx);
@@ -1697,6 +1698,49 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                         }
                     })));
                 });
+            }
+            OpenRequestKind::ExternalReview { enable, base } => {
+                let base_open_options = zed::open_options_for_request(
+                    request.open_behavior,
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    cx,
+                );
+                let review_path = request.open_paths.first().map(PathBuf::from);
+                cx.spawn(async move |cx| {
+                    let paths_with_position =
+                        derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
+                    let (window, _results) = open_paths_with_positions(
+                        &paths_with_position,
+                        &[],
+                        false,
+                        app_state,
+                        base_open_options,
+                        cx,
+                    )
+                    .await?;
+
+                    let start = window.update(cx, |multi_workspace, _, cx| {
+                        let workspace = multi_workspace.workspace().clone();
+                        if enable {
+                            let project = workspace.read(cx).project().clone();
+                            Some(external_review::start(
+                                workspace.downgrade(),
+                                project,
+                                review_path,
+                                base,
+                                cx,
+                            ))
+                        } else {
+                            external_review::stop(workspace.entity_id(), cx);
+                            None
+                        }
+                    })?;
+                    if let Some(start) = start {
+                        start.await?;
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
             }
             OpenRequestKind::GitCommit { sha } => {
                 let base_open_options = zed::open_options_for_request(

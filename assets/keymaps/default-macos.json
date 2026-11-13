@@ -239,6 +239,19 @@
     },
   },
   {
+    "context": "Editor && external_review",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-alt-y": "external_review::Keep",
+      "cmd-alt-z": "external_review::Reject",
+      "shift-alt-y": "external_review::KeepAll",
+      "shift-alt-z": "external_review::RejectAll",
+      "cmd-y": "external_review::Keep",
+      "cmd-n": "external_review::Reject",
+      "cmd-z": "external_review::Undo",
+    },
+  },
+  {
     "context": "Editor && editor_agent_diff",
     "use_key_equivalents": true,
     "bindings": {

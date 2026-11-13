@@ -80,6 +80,12 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    /// Starts or stops reviewing external changes in the repository of the opened path.
+    ExternalReview {
+        enable: bool,
+        /// Git tree or commit to diff against. Defaults to the repository's current state.
+        base: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -118,6 +124,11 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::ExternalReview { enable, base } => f
+                .debug_struct("ExternalReview")
+                .field("enable", enable)
+                .field("base", base)
+                .finish(),
         }
     }
 }
@@ -192,6 +203,8 @@ impl OpenRequest {
                 this.parse_git_clone_url(clone_path)?
             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
+            } else if let Some(review_path) = url.strip_prefix("zed://review/") {
+                this.parse_external_review_url(review_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
@@ -285,6 +298,33 @@ impl OpenRequest {
         self.kind = Some(OpenRequestKind::GitCommit {
             sha: sha.to_string(),
         });
+
+        Ok(())
+    }
+
+    fn parse_external_review_url(&mut self, review_path: &str) -> Result<()> {
+        // Format: on?path=<path>[&base=<tree or commit>] or off?path=<path>
+        let (command, query) = review_path
+            .split_once('?')
+            .context("invalid review url: missing query string")?;
+        let enable = match command {
+            "on" => true,
+            "off" => false,
+            _ => anyhow::bail!("invalid review url: expected on or off, got {command:?}"),
+        };
+        let mut path = None;
+        let mut base = None;
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "path" if !value.is_empty() => path = Some(value.to_string()),
+                "base" if !value.is_empty() => base = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        let path = path.context("invalid review url: missing path query parameter")?;
+
+        self.open_paths.push(path);
+        self.kind = Some(OpenRequestKind::ExternalReview { enable, base });
 
         Ok(())
     }

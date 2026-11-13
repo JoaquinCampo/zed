@@ -6142,6 +6142,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "external_review"
+version = "0.1.0"
+dependencies = [
+ "action_log",
+ "anyhow",
+ "buffer_diff",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "text",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "failspot"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22549,6 +22568,7 @@ dependencies = [
  "extension",
  "extension_host",
  "extensions_ui",
+ "external_review",
  "feature_flags",
  "feedback",
  "file_finder",

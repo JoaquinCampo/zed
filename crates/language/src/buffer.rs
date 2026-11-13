@@ -312,6 +312,8 @@ pub enum BufferEditSource {
     User,
     Agent,
     Remote,
+    /// The buffer was reloaded because its file changed on disk.
+    Reload,
 }
 
 impl BufferEditSource {
@@ -1741,7 +1743,7 @@ impl Buffer {
                     this.finalize_last_transaction();
                     let old_encoding = this.encoding;
                     let old_has_bom = this.has_bom;
-                    this.apply_diff(diff, cx);
+                    this.apply_diff_with_source(diff, BufferEditSource::Reload, cx);
                     this.encoding = encoding_used;
                     this.has_bom = has_bom;
                     let transaction = this.finalize_last_transaction().cloned();
@@ -2482,6 +2484,15 @@ impl Buffer {
     /// calculated, then adjust the diff to account for those changes, and discard any
     /// parts of the diff that conflict with those changes.
     pub fn apply_diff(&mut self, diff: Diff, cx: &mut Context<Self>) -> Option<TransactionId> {
+        self.apply_diff_with_source(diff, BufferEditSource::User, cx)
+    }
+
+    fn apply_diff_with_source(
+        &mut self,
+        diff: Diff,
+        source: BufferEditSource,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
         let snapshot = self.snapshot();
         let mut edits_since = snapshot.edits_since::<usize>(&diff.base_version).peekable();
         let mut delta = 0;
@@ -2512,7 +2523,7 @@ impl Buffer {
         self.start_transaction();
         self.text.set_line_ending(diff.line_ending);
         self.edit(adjusted_edits, None, cx);
-        self.end_transaction(cx)
+        self.end_transaction_with_source(source, cx)
     }
 
     pub fn has_unsaved_edits(&self) -> bool {

@@ -7,7 +7,7 @@ use futures::{FutureExt, StreamExt, channel::mpsc};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferEvent, Point, ToOffset, ToPoint};
+use language::{Anchor, Buffer, BufferEditSource, BufferEvent, Point, ToOffset, ToPoint};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
 use std::{
     cmp,
@@ -62,6 +62,10 @@ pub struct ActionLog {
     last_reject_undo: Option<LastRejectUndo>,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
+    /// When set, changes that reach a buffer by reloading it from disk count as agent
+    /// edits, and committed edits are not kept automatically. Used to review changes
+    /// that other programs make to the files.
+    disk_changes_are_agent_edits: bool,
 }
 
 impl ActionLog {
@@ -73,7 +77,15 @@ impl ActionLog {
             linked_action_log: None,
             last_reject_undo: None,
             file_read_times: HashMap::default(),
+            disk_changes_are_agent_edits: false,
         }
+    }
+
+    /// Attributes changes made to the files outside Zed to the agent, so they can be
+    /// reviewed like agent edits. Edits typed in Zed still count as user edits.
+    pub fn with_disk_changes_as_agent_edits(mut self) -> Self {
+        self.disk_changes_are_agent_edits = true;
+        self
     }
 
     pub fn with_linked_action_log(mut self, linked_action_log: Entity<ActionLog>) -> Self {
@@ -220,12 +232,17 @@ impl ActionLog {
         cx: &mut Context<Self>,
     ) {
         match event {
-            BufferEvent::Edited { .. } => {
+            BufferEvent::Edited { source } => {
                 let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
                     return;
                 };
                 let buffer_version = buffer.read(cx).version();
                 if !buffer_version.changed_since(&tracked_buffer.version) {
+                    return;
+                }
+                if self.disk_changes_are_agent_edits && *source == BufferEditSource::Reload {
+                    tracked_buffer.version = buffer_version;
+                    tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
                     return;
                 }
                 self.handle_buffer_edited(buffer, cx);
@@ -285,14 +302,19 @@ impl ActionLog {
         mut buffer_updates: mpsc::UnboundedReceiver<(ChangeAuthor, text::BufferSnapshot)>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        let git_diff = this
-            .update(cx, |this, cx| {
+        let keep_committed_edits =
+            this.read_with(cx, |this, _| !this.disk_changes_are_agent_edits)?;
+        let git_diff = if keep_committed_edits {
+            this.update(cx, |this, cx| {
                 this.project.update(cx, |project, cx| {
                     project.open_uncommitted_diff(buffer.clone(), cx)
                 })
             })?
             .await
-            .ok();
+            .ok()
+        } else {
+            None
+        };
         let (mut git_diff_updates_tx, mut git_diff_updates_rx) = watch::channel(());
         let _diff_subscription = if let Some(git_diff) = git_diff.as_ref() {
             cx.update(|cx| {
@@ -528,6 +550,65 @@ impl ActionLog {
             cx.notify();
             anyhow::Ok(())
         })?
+    }
+
+    pub fn is_tracking(&self, buffer: &Entity<Buffer>) -> bool {
+        self.tracked_buffers.contains_key(buffer)
+    }
+
+    /// The diff of a tracked buffer against its review base, even when it has no edits left.
+    pub fn tracked_diff(&self, buffer: &Entity<Buffer>) -> Option<Entity<BufferDiff>> {
+        Some(self.tracked_buffers.get(buffer)?.diff.clone())
+    }
+
+    /// The text that a tracked buffer's unreviewed edits are shown against.
+    pub fn review_base(&self, buffer: &Entity<Buffer>) -> Option<Rope> {
+        Some(self.tracked_buffers.get(buffer)?.diff_base.clone())
+    }
+
+    /// Puts back a base saved with [`Self::review_base`], so that edits kept or rejected
+    /// since then are shown for review again. Edits made to the buffer earlier in the
+    /// same update are not taken as the user's.
+    pub fn restore_review_base(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        diff_base: Rope,
+        cx: &mut Context<Self>,
+    ) {
+        let version = buffer.read(cx).version();
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(buffer) else {
+            return;
+        };
+        tracked_buffer.diff_base = diff_base;
+        tracked_buffer.version = version;
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        cx.notify();
+    }
+
+    /// Starts tracking a buffer whose file another program changed on disk. `base_text`
+    /// is the file's text before the change, or `None` if the program created the file.
+    /// Later disk changes are picked up as reloads, so this only acts once per buffer.
+    pub fn track_disk_change(
+        &mut self,
+        buffer: Entity<Buffer>,
+        base_text: Option<Rope>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tracked_buffers.contains_key(&buffer) {
+            return;
+        }
+        let tracked_buffer = self.track_buffer_internal(buffer, false, cx);
+        match base_text {
+            Some(base_text) => tracked_buffer.diff_base = base_text,
+            None => {
+                tracked_buffer.status = TrackedBufferStatus::Created {
+                    existing_file_content: None,
+                };
+                tracked_buffer.diff_base = Rope::default();
+            }
+        }
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        cx.notify();
     }
 
     /// Track a buffer as read by agent, so we can notify the model about user edits.
@@ -3517,6 +3598,137 @@ mod tests {
         range: Range<Point>,
         diff_status: DiffHunkStatusKind,
         old_text: String,
+    }
+
+    #[gpui::test]
+    async fn test_review_disk_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "abc\ndef\nghi\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_disk_changes_as_agent_edits());
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        action_log.update(cx, |log, cx| {
+            log.track_disk_change(buffer.clone(), Some(Rope::from("abc\ndef\nghi\n")), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
+
+        // Another program changes the file.
+        fs.insert_file(path!("/dir/file"), "abc\nDEF\nghi\n".as_bytes().to_vec())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\nDEF\nghi\n"
+        );
+        assert_eq!(
+            unreviewed_hunks(&action_log, cx),
+            vec![(
+                buffer.clone(),
+                vec![HunkStatus {
+                    range: Point::new(1, 0)..Point::new(2, 0),
+                    diff_status: DiffHunkStatusKind::Modified,
+                    old_text: "def\n".into(),
+                }],
+            )]
+        );
+
+        // Edits typed in Zed are not part of the review.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(2, 0)..Point::new(2, 3), "GHI")], None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            unreviewed_hunks(&action_log, cx),
+            vec![(
+                buffer.clone(),
+                vec![HunkStatus {
+                    range: Point::new(1, 0)..Point::new(2, 0),
+                    diff_status: DiffHunkStatusKind::Modified,
+                    old_text: "def\n".into(),
+                }],
+            )]
+        );
+
+        // Rejecting restores the base text on disk and keeps the typed edit.
+        action_log
+            .update(cx, |log, cx| {
+                log.reject_edits_in_ranges(
+                    buffer.clone(),
+                    vec![Point::new(1, 0)..Point::new(1, 0)],
+                    None,
+                    cx,
+                )
+                .0
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
+        assert_eq!(
+            fs.load(path!("/dir/file").as_ref()).await.unwrap(),
+            "abc\ndef\nGHI\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_file_created_on_disk(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"new": "hello\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_disk_changes_as_agent_edits());
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/new", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        action_log.update(cx, |log, cx| {
+            log.track_disk_change(buffer.clone(), None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            unreviewed_hunks(&action_log, cx),
+            vec![(
+                buffer.clone(),
+                vec![HunkStatus {
+                    range: Point::new(0, 0)..Point::new(1, 0),
+                    diff_status: DiffHunkStatusKind::Added,
+                    old_text: "".into(),
+                }],
+            )]
+        );
+
+        // Rejecting a created file deletes it.
+        action_log
+            .update(cx, |log, cx| {
+                log.reject_edits_in_ranges(
+                    buffer.clone(),
+                    vec![Point::new(0, 0)..Point::new(0, 0)],
+                    None,
+                    cx,
+                )
+                .0
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!fs.is_file(path!("/dir/new").as_ref()).await);
     }
 
     fn unreviewed_hunks(

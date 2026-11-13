@@ -4890,9 +4890,10 @@ impl EditorElement {
                     continue;
                 }
 
-                if active_rows
-                    .iter()
-                    .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
+                if diff_hunk_renderer.show_controls_on_every_hunk()
+                    || active_rows
+                        .iter()
+                        .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
                 {
                     let hunk_start_y: Pixels = (display_row_range.start.as_f64()
                         * ScrollPixelOffset::from(line_height)

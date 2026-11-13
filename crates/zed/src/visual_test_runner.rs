@@ -393,6 +393,18 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     let mut failed = 0;
     let mut updated = 0;
 
+    if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("external_review") {
+        let result = run_external_review_visual_tests(app_state.clone(), &mut cx, update_baseline);
+        println!(
+            "external_review: {}",
+            match &result {
+                Ok(_) => "done".to_string(),
+                Err(error) => format!("FAILED - {error:#}"),
+            }
+        );
+        return result.map(|_| ());
+    }
+
     // Run Test 1: Project Panel (with project panel visible)
     println!("\n--- Test 1: project_panel ---");
     match run_visual_test(
@@ -1463,6 +1475,282 @@ fn run_settings_ui_subpage_visual_tests(
             Ok(TestResult::BaselineUpdated(p.clone()))
         }
     }
+}
+
+/// Captures an editor reviewing changes that another program wrote to the file.
+#[cfg(target_os = "macos")]
+fn run_external_review_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let temp_path = tempfile::tempdir()?.keep();
+    let project_path = temp_path.canonicalize()?.join("project");
+    std::fs::create_dir_all(&project_path)?;
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_path)
+            .output()
+    };
+    git(&["init"])?;
+    git(&["config", "user.email", "test@test.com"])?;
+    git(&["config", "user.name", "Test User"])?;
+    let original = "def greet(name):\n    print(\"hello\", name)\n\n\ndef add(a, b):\n    return a + b\n\n\ndef main():\n    greet(\"world\")\n    print(add(2, 3))\n";
+    std::fs::write(project_path.join("app.py"), original)?;
+    git(&["add", "app.py"])?;
+    git(&["commit", "-m", "Initial commit"])?;
+
+    cx.update(|cx| {
+        external_review::init(cx);
+        cx.bind_keys([
+            KeyBinding::new(
+                "cmd-y",
+                external_review::Keep,
+                Some("Editor && external_review"),
+            ),
+            KeyBinding::new(
+                "cmd-n",
+                external_review::Reject,
+                Some("Editor && external_review"),
+            ),
+            KeyBinding::new(
+                "cmd-z",
+                external_review::Undo,
+                Some("Editor && external_review"),
+            ),
+        ]);
+    });
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let add_worktree_task = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(&project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    let (worktree, _) = cx.foreground_executor.block_test(add_worktree_task)?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let window_size = size(px(900.0), px(520.0));
+    let workspace_window: WindowHandle<MultiWorkspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: window_size,
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    });
+                    cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+                },
+            )
+        })
+        .context("Failed to open external review test window")?;
+    cx.run_until_parked();
+    let workspace = workspace_window.update(cx, |multi_workspace, _, _| {
+        multi_workspace.workspace().clone()
+    })?;
+
+    let worktree_id = cx.read(|cx| worktree.read(cx).id());
+    let open_file = workspace_window.update(cx, |_, window, cx| {
+        let rel_path: Arc<util::rel_path::RelPath> = util::rel_path::rel_path("app.py").into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_path((worktree_id, rel_path), None, true, window, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor.block_test(open_file)?;
+    cx.background_executor.forbid_parking();
+
+    let start_review = cx.update(|cx| {
+        let project = workspace.read(cx).project().clone();
+        external_review::start(
+            workspace.downgrade(),
+            project,
+            Some(project_path.clone()),
+            None,
+            cx,
+        )
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor.block_test(start_review)?;
+    cx.background_executor.forbid_parking();
+
+    // Another program edits the file.
+    let changed = original
+        .replace(
+            "    print(\"hello\", name)\n",
+            "    \"\"\"Say hello to someone.\"\"\"\n    print(f\"Hello, {name}!\")\n",
+        )
+        .replace(
+            "def add(a, b):\n    return a + b\n",
+            "def add(a: int, b: int) -> int:\n    return a + b\n\n\ndef multiply(a: int, b: int) -> int:\n    return a * b\n",
+        )
+        .replace(
+            "    print(add(2, 3))\n",
+            "    print(add(2, 3))\n    print(multiply(4, 5))\n",
+        );
+    std::fs::write(project_path.join("app.py"), changed)?;
+
+    // File watching and git run outside the test dispatcher, so give them real time.
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+        cx.background_executor.allow_parking();
+        cx.advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        cx.background_executor.forbid_parking();
+    }
+    let pump = |cx: &mut VisualTestAppContext| -> Result<()> {
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(30));
+            cx.background_executor.allow_parking();
+            cx.advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+            cx.background_executor.forbid_parking();
+        }
+        cx.update_window(workspace_window.into(), |_, window, _cx| window.refresh())?;
+        cx.run_until_parked();
+        Ok(())
+    };
+    pump(cx)?;
+    let mut results = vec![run_visual_test(
+        "external_review",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?];
+
+    // Puts the cursor on `row` (zero-based) and presses `keystrokes`.
+    let press = |row: u32, keystrokes: &str, cx: &mut VisualTestAppContext| {
+        workspace_window.update(cx, |_, window, cx| {
+            let editor = workspace
+                .read(cx)
+                .active_item(cx)
+                .and_then(|item| item.act_as::<editor::Editor>(cx))
+                .context("no active editor")?;
+            editor.update(cx, |editor, cx| {
+                // Rows count lines of the file, while expanded hunks add their removed lines
+                // to the editor, so go through a buffer anchor.
+                let multibuffer = editor.buffer().read(cx);
+                let anchor = multibuffer.as_singleton().and_then(|buffer| {
+                    let text_anchor = buffer.read(cx).anchor_before(language::Point::new(row, 0));
+                    multibuffer.snapshot(cx).anchor_in_buffer(text_anchor)
+                });
+                if let Some(anchor) = anchor {
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_anchor_ranges([anchor..anchor])
+                    });
+                }
+            });
+            window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx), cx);
+            anyhow::Ok(())
+        })??;
+        // Focus takes effect when the window draws, so draw before pressing keys.
+        cx.update_window(workspace_window.into(), |_, window, _cx| window.refresh())?;
+        cx.run_until_parked();
+        cx.simulate_keystrokes(workspace_window.into(), keystrokes);
+        anyhow::Ok(())
+    };
+    let file_text = || std::fs::read_to_string(project_path.join("app.py"));
+
+    // Reject the change to `add`, on row 5.
+    press(5, "cmd-n", cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        file_text()?.contains("def add(a, b):\n"),
+        "reject did not restore the base text on disk"
+    );
+    results.push(run_visual_test(
+        "external_review_rejected",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    // Undo brings the change and its review back.
+    press(5, "cmd-z", cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        file_text()?.contains("def add(a: int, b: int) -> int:\n"),
+        "undo did not restore the external change on disk"
+    );
+    results.push(run_visual_test(
+        "external_review_reject_undone",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    // Keep `multiply`, on row 9, then undo the keep.
+    press(9, "cmd-y", cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        external_review_hunk_count(&workspace, cx) == 3,
+        "keep did not remove the multiply hunk from the review"
+    );
+    results.push(run_visual_test(
+        "external_review_kept",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+    press(9, "cmd-z", cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        external_review_hunk_count(&workspace, cx) == 4,
+        "undoing the keep did not bring the multiply hunk back"
+    );
+    results.push(run_visual_test(
+        "external_review_keep_undone",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    Ok(results
+        .into_iter()
+        .find(|result| matches!(result, TestResult::BaselineUpdated(_)))
+        .unwrap_or(TestResult::Passed))
+}
+
+/// The number of diff hunks shown in the active editor.
+#[cfg(target_os = "macos")]
+fn external_review_hunk_count(
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestAppContext,
+) -> usize {
+    cx.update(|cx| {
+        let Some(editor) = workspace
+            .read(cx)
+            .active_item(cx)
+            .and_then(|item| item.act_as::<editor::Editor>(cx))
+        else {
+            return 0;
+        };
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+        snapshot.diff_hunks().count()
+    })
 }
 
 /// Runs visual tests for the diff review button in git diff views.

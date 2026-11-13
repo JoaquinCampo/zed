@@ -193,6 +193,17 @@
     },
   },
   {
+    "context": "Editor && external_review",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-alt-y": "external_review::Keep",
+      "ctrl-alt-z": "external_review::Reject",
+      "shift-alt-y": "external_review::KeepAll",
+      "shift-alt-z": "external_review::RejectAll",
+      "ctrl-z": "external_review::Undo",
+    },
+  },
+  {
     "context": "Editor && editor_agent_diff",
     "use_key_equivalents": true,
     "bindings": {

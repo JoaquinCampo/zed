@@ -38,6 +38,12 @@ pub trait DiffHunkRenderer {
     fn render_hunk_as_staged(&self, status: &DiffHunkStatus, _cx: &App) -> bool {
         !status.has_secondary_hunk()
     }
+
+    /// Whether every expanded hunk shows its controls, rather than only the hunk
+    /// under the mouse or the cursor.
+    fn show_controls_on_every_hunk(&self) -> bool {
+        false
+    }
 }
 
 pub struct DefaultDiffHunkRenderer;
