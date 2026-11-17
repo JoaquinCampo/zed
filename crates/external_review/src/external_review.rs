@@ -113,8 +113,10 @@ pub fn is_active(workspace_id: EntityId, cx: &App) -> bool {
 /// Starts reviewing external changes in the git repository containing `path`, or the
 /// repository of the workspace's first worktree. `base` is a git tree or commit to diff
 /// against; without it, the repository's current state (including untracked files) is used.
-/// Starting again replaces the running review. Safe to call while the workspace is
-/// being updated, since the workspace is only used once the review is ready.
+/// Starting again with the same repository and base keeps the running review, with
+/// what was kept and the undo history; anything else replaces it. Safe to call while
+/// the workspace is being updated, since the workspace is only used once the review
+/// is ready.
 pub fn start(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -150,6 +152,13 @@ pub fn start(
             .await?;
         let workspace = workspace.upgrade().context("workspace was closed")?;
         cx.update(|cx| {
+            let running = session_for(workspace.entity_id(), cx);
+            if running.is_some_and(|session| {
+                let session = session.read(cx);
+                session.repo_root == repo_root && session.base == base
+            }) {
+                return;
+            }
             stop(workspace.entity_id(), cx);
             log::info!("external review started in {repo_root:?} against {base}");
             let session =

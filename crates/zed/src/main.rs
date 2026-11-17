@@ -1700,11 +1700,13 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 });
             }
             OpenRequestKind::ExternalReview { enable, base } => {
-                let base_open_options = zed::open_options_for_request(
+                let mut base_open_options = zed::open_options_for_request(
                     request.open_behavior,
                     &workspace::SerializedWorkspaceLocation::Local,
                     cx,
                 );
+                // Review the repository in the window that already has it open.
+                base_open_options.workspace_matching = workspace::WorkspaceMatching::MatchExact;
                 let review_path = request.open_paths.first().map(PathBuf::from);
                 cx.spawn(async move |cx| {
                     let paths_with_position =
