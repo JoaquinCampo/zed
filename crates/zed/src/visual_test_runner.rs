@@ -1838,6 +1838,10 @@ fn run_external_review_visual_tests(
             })
     });
     anyhow::ensure!(panel_open, "ToggleFocus did not open the review panel on the left");
+    let panel_zoomed = cx.read(|cx| {
+        workspace.read(cx).zoomed_item().is_some_and(|item| item.upgrade().is_some())
+    });
+    anyhow::ensure!(panel_zoomed, "the review panel did not take the whole window");
     results.push(run_visual_test(
         "external_review_panel",
         workspace_window.into(),
@@ -1865,6 +1869,8 @@ fn run_external_review_visual_tests(
     let right_dock_open =
         cx.read(|cx| workspace.read(cx).left_dock().read(cx).is_open());
     anyhow::ensure!(!right_dock_open, "ToggleFocus did not close the review panel");
+    let still_zoomed = cx.read(|cx| workspace.read(cx).zoomed_item().is_some_and(|item| item.upgrade().is_some()));
+    anyhow::ensure!(!still_zoomed, "closing the review left the window zoomed");
 
     // Toggling the left dock (cmd-b) then shows the file tree, not the review.
     dispatch(Box::new(workspace::ToggleLeftDock), cx)?;

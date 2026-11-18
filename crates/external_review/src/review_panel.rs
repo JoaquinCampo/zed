@@ -31,6 +31,8 @@ pub struct ReviewPanel {
     position: DockPosition,
     /// The dock's panel before the review opened, shown again once it closes.
     return_to: Option<&'static str>,
+    /// Whether the panel covers the whole window, as it does whenever it is shown.
+    zoomed: bool,
     /// Whether the review is showing because it was asked for.
     requested: bool,
     _subscription: Subscription,
@@ -61,6 +63,7 @@ impl ReviewPanel {
             position: saved_position(cx),
             return_to: None,
             requested: false,
+            zoomed: false,
             // The dock button shows only while a review runs.
             _subscription: cx.observe_global::<ReviewSessions>(|_, cx| cx.notify()),
         }
@@ -86,8 +89,10 @@ pub fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
             }
             panel.requested = true;
         });
+        workspace.focus_panel::<ReviewPanel>(window, cx);
+        // The review has the whole window, since the code needs the width.
+        panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
     }
-    workspace.focus_panel::<ReviewPanel>(window, cx);
 }
 
 impl EventEmitter<PanelEvent> for ReviewPanel {}
@@ -178,6 +183,9 @@ impl Panel for ReviewPanel {
         }
         if !active {
             self.requested = false;
+            if self.zoomed {
+                cx.emit(PanelEvent::ZoomOut);
+            }
         }
         let workspace = self.workspace.clone();
         let position = self.position;
@@ -209,6 +217,15 @@ impl Panel for ReviewPanel {
                 }
             });
         });
+    }
+
+    fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
+        self.zoomed
+    }
+
+    fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        cx.notify();
     }
 
     fn activation_priority(&self) -> u32 {
