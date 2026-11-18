@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Builds this checkout as a stable-channel release and installs it in place of
+# /Applications/Zed.app, so it uses the usual settings, extensions and recent
+# projects. The app that was there is kept next to it as a backup, and its
+# bundle (Info.plist, icons, the bundled git, frameworks) is reused around the new
+# binaries. Signed ad hoc, without the entitlements that need Zed's team key.
+#
+# Usage: script/install-local-release   (SKIP_BUILD=1 to reuse the last build)
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+target_triple=aarch64-apple-darwin
+target_dir="target/${target_triple}/release"
+app=/Applications/Zed.app
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -1)
+
+if [[ "${SKIP_BUILD:-}" != 1 ]]; then
+    export ZED_RELEASE_CHANNEL=stable
+    export MACOSX_DEPLOYMENT_TARGET=12.0
+    export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+    cargo --config .cargo/bundle-config.toml build --release \
+        --package zed --package cli --target "$target_triple"
+fi
+
+[[ -d "$app" ]] || { echo "no $app to use as the bundle template" >&2; exit 1; }
+template="$app"
+installed_version=$(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString)
+backup="$HOME/Applications/Zed-${installed_version}-backup.app"
+if ! codesign -dv "$app" 2>&1 | grep -q "Signature=adhoc"; then
+    # The app in place is an official build: keep it as the backup and template.
+    mkdir -p "$HOME/Applications"
+    if [[ ! -d "$backup" ]]; then
+        ditto "$app" "$backup"
+        echo "Backed up the installed Zed to $backup"
+    fi
+fi
+
+staging=$(mktemp -d)/Zed.app
+ditto "$template" "$staging"
+cp "$target_dir/zed" "$staging/Contents/MacOS/zed"
+cp "$target_dir/cli" "$staging/Contents/MacOS/cli"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$staging/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$staging/Contents/Info.plist" 2>/dev/null || true
+
+entitlements=$(mktemp)
+sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$entitlements"
+rm -f "$staging/Contents/embedded.provisionprofile"
+codesign --force --deep --entitlements "$entitlements" --sign - "$staging"
+
+if pgrep -xf "$app/Contents/MacOS/zed" > /dev/null; then
+    echo "Quit Zed before installing" >&2
+    exit 1
+fi
+rm -r "$app"
+mv "$staging" "$app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"
+echo "Installed Zed $version at $app"
