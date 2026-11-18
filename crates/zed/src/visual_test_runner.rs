@@ -1728,6 +1728,66 @@ fn run_external_review_visual_tests(
         update_baseline,
     )?);
 
+    // Another program creates a file, and the Review tab lists both files.
+    std::fs::write(
+        project_path.join("notes.md"),
+        "# Notes\n\nGreeting now uses an f-string.\n",
+    )?;
+    pump(cx)?;
+    pump(cx)?;
+    let dispatch = |action: Box<dyn gpui::Action>, cx: &mut VisualTestAppContext| {
+        workspace_window.update(cx, |_, window, cx| window.dispatch_action(action, cx))?;
+        cx.run_until_parked();
+        anyhow::Ok(())
+    };
+    dispatch(Box::new(external_review::OpenReview), cx)?;
+    pump(cx)?;
+    let pane_is_active = cx.read(|cx| {
+        workspace
+            .read(cx)
+            .active_item(cx)
+            .is_some_and(|item| item.downcast::<external_review::ReviewPane>().is_some())
+    });
+    anyhow::ensure!(pane_is_active, "OpenReview did not show the Review tab");
+    anyhow::ensure!(
+        external_review_hunk_count(&workspace, cx) == 5,
+        "the Review tab should show the 4 hunks of app.py and the new notes.md, got {}",
+        external_review_hunk_count(&workspace, cx)
+    );
+    let status: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        project_path.join(".git/zed-review.json"),
+    )?)?;
+    anyhow::ensure!(
+        status["files"] == 2 && status["hunks"] == 5,
+        "unexpected status file: {status}"
+    );
+    results.push(run_visual_test(
+        "external_review_pane",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    // Keep All empties the tab, and undo brings everything back.
+    dispatch(Box::new(external_review::KeepAll), cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        external_review_hunk_count(&workspace, cx) == 0,
+        "Keep All left hunks in the Review tab"
+    );
+    results.push(run_visual_test(
+        "external_review_pane_done",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+    dispatch(Box::new(external_review::Undo), cx)?;
+    pump(cx)?;
+    anyhow::ensure!(
+        external_review_hunk_count(&workspace, cx) == 5,
+        "undoing Keep All did not bring the hunks back"
+    );
+
     Ok(results
         .into_iter()
         .find(|result| matches!(result, TestResult::BaselineUpdated(_)))

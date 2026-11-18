@@ -1699,7 +1699,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     })));
                 });
             }
-            OpenRequestKind::ExternalReview { enable, base } => {
+            OpenRequestKind::ExternalReview { enable, open, base } => {
                 let mut base_open_options = zed::open_options_for_request(
                     request.open_behavior,
                     &workspace::SerializedWorkspaceLocation::Local,
@@ -1739,6 +1739,14 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     })?;
                     if let Some(start) = start {
                         start.await?;
+                    }
+                    if open {
+                        window.update(cx, |multi_workspace, window, cx| {
+                            multi_workspace.workspace().clone().update(cx, |workspace, cx| {
+                                external_review::ReviewPane::deploy(workspace, window, cx)
+                            });
+                            window.activate_window();
+                        })?;
                     }
                     anyhow::Ok(())
                 })

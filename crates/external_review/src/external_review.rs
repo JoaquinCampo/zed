@@ -4,17 +4,25 @@
 //! is the base. Every file that differs from it is shown with its hunks expanded,
 //! and each hunk can be kept or rejected, the same way agent edits are reviewed.
 //! Edits typed in Zed are not part of the review.
+//!
+//! The Review tab lists every change still waiting for review, and a status bar
+//! item counts them. While a review runs, its counts are also written to
+//! `zed-review.json` in the repository's git directory, for other programs to show.
+
+mod review_pane;
+
+pub use review_pane::{PendingCounts, ReviewIndicator, ReviewPane};
 
 use action_log::ActionLog;
 use anyhow::{Context as _, Result};
-use buffer_diff::DiffHunkStatus;
+use buffer_diff::{BufferDiff, DiffHunkStatus};
 use collections::HashMap;
 use editor::{DiffHunkRenderer, Editor};
 use gpui::{
     AnyElement, App, AppContext as _, Entity, EntityId, Focusable as _, Global, Pixels,
     Subscription, Task, TaskExt as _, WeakEntity, Window, actions,
 };
-use language::Buffer;
+use language::{Buffer, OffsetRangeExt as _, Point};
 use project::{Project, buffer_store::BufferStoreEvent};
 use std::{
     ops::Range,
@@ -27,6 +35,7 @@ use std::{
 };
 use text::{LineEnding, Rope};
 use ui::{KeyBinding, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::Workspace;
 
 actions!(
@@ -34,22 +43,31 @@ actions!(
     [
         /// Starts or stops reviewing changes that other programs make to the project.
         Toggle,
+        /// Opens the tab with every change waiting for review.
+        OpenReview,
         /// Keeps the external changes in the selected hunks.
         Keep,
         /// Rejects the external changes in the selected hunks, restoring the base text.
         Reject,
-        /// Keeps every external change in the current file.
+        /// Keeps every external change in the current file, or in the Review tab.
         KeepAll,
-        /// Rejects every external change in the current file.
+        /// Rejects every external change in the current file, or in the Review tab.
         RejectAll,
-        /// Undoes the last keep or reject in the current file, showing its changes for
-        /// review again. Falls back to the editor's undo when there is none to undo.
+        /// Undoes the last keep or reject in the current file (in the Review tab, the
+        /// last one anywhere), showing its changes for review again. Falls back to the
+        /// editor's undo when there is none to undo.
         Undo,
     ]
 );
 
 /// How long to wait after a file system event before comparing the repository with the base.
 const SCAN_DELAY: Duration = Duration::from_millis(150);
+
+/// How long to wait after a review change before writing the status file.
+const STATUS_DELAY: Duration = Duration::from_millis(200);
+
+/// Name of the file in the git directory that holds the running review's counts.
+const STATUS_FILE_NAME: &str = "zed-review.json";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -61,6 +79,9 @@ pub fn init(cx: &mut App) {
                 let project = workspace.project().clone();
                 start(cx.weak_entity(), project, None, None, cx).detach_and_log_err(cx);
             }
+        });
+        workspace.register_action(|workspace, _: &OpenReview, window, cx| {
+            ReviewPane::deploy(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &Keep, _, cx| {
             review_active_editor(workspace, ReviewKind::Keep, false, cx);
@@ -76,13 +97,18 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &Undo, _, cx| {
             let session = session_for(cx.entity_id(), cx);
-            let buffer = workspace
+            let editor = workspace
                 .active_item(cx)
                 .and_then(|item| item.act_as::<Editor>(cx))
-                .and_then(|editor| editor.read(cx).buffer().read(cx).as_singleton());
-            let undone = match (session, buffer) {
-                (Some(session), Some(buffer)) => {
-                    session.update(cx, |session, cx| session.undo_review(&buffer, cx))
+                .filter(|editor| editor.read(cx).addon::<ExternalReviewAddon>().is_some());
+            let undone = match (session, editor) {
+                (Some(session), Some(editor)) => {
+                    let buffer = editor.read(cx).buffer().read(cx).as_singleton();
+                    session.update(cx, |session, cx| match buffer {
+                        Some(buffer) => session.undo_review(Some(&buffer), cx),
+                        // The Review tab shows every file, so it undoes the latest action.
+                        None => session.undo_review(None, cx),
+                    })
                 }
                 _ => false,
             };
@@ -139,30 +165,48 @@ pub fn start(
         .visible_worktrees(cx)
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
         .collect::<Vec<_>>();
+    let workspace_id = workspace.entity_id();
     cx.spawn(async move |cx| {
-        let (repo_root, base) = cx
+        let (repo_root, git_dir) = cx
             .background_spawn(async move {
                 let repo_root = repository_root(&path, &worktree_roots).await?;
-                let base = match base {
-                    Some(base) => resolve_tree(&repo_root, &base).await?,
-                    None => snapshot_tree(&repo_root).await?,
-                };
-                anyhow::Ok((repo_root, base))
+                let git_dir =
+                    PathBuf::from(git_line(&repo_root, &["rev-parse", "--absolute-git-dir"]).await?);
+                anyhow::Ok((repo_root, git_dir))
             })
             .await?;
+        let running_base = cx.update(|cx| {
+            session_for(workspace_id, cx)
+                .map(|session| session.read(cx))
+                .filter(|session| session.repo_root == repo_root)
+                .map(|session| session.base.clone())
+        });
+        let base = match (base, running_base) {
+            // Without a base, a running review of the same repository goes on.
+            (None, Some(_)) => return Ok(()),
+            (Some(base), running_base) => {
+                let repo_root = repo_root.clone();
+                let base = cx
+                    .background_spawn(async move { resolve_tree(&repo_root, &base).await })
+                    .await?;
+                if running_base.as_ref() == Some(&base) {
+                    return Ok(());
+                }
+                base
+            }
+            (None, None) => {
+                let repo_root = repo_root.clone();
+                cx.background_spawn(async move { snapshot_tree(&repo_root).await })
+                    .await?
+            }
+        };
         let workspace = workspace.upgrade().context("workspace was closed")?;
         cx.update(|cx| {
-            let running = session_for(workspace.entity_id(), cx);
-            if running.is_some_and(|session| {
-                let session = session.read(cx);
-                session.repo_root == repo_root && session.base == base
-            }) {
-                return;
-            }
             stop(workspace.entity_id(), cx);
             log::info!("external review started in {repo_root:?} against {base}");
-            let session =
-                cx.new(|cx| ReviewSession::new(workspace.clone(), project, repo_root, base, cx));
+            let session = cx.new(|cx| {
+                ReviewSession::new(workspace.clone(), project, repo_root, git_dir, base, cx)
+            });
             cx.default_global::<ReviewSessions>()
                 .0
                 .insert(workspace.entity_id(), session);
@@ -177,14 +221,25 @@ pub fn stop(workspace_id: EntityId, cx: &mut App) {
         .0
         .remove(&workspace_id);
     if let Some(session) = session {
-        session.update(cx, |session, cx| session.clear_editors(cx));
+        session.update(cx, |session, cx| {
+            session.clear_editors(cx);
+            session.remove_status_file(cx);
+        });
     }
+}
+
+/// One file with changes waiting for review.
+struct PendingChange {
+    buffer: Entity<Buffer>,
+    diff: Entity<BufferDiff>,
+    hunk_ranges: Vec<Range<Point>>,
 }
 
 struct ReviewSession {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     repo_root: PathBuf,
+    git_dir: PathBuf,
     base: String,
     action_log: Entity<ActionLog>,
     reviewing_editors: HashMap<WeakEntity<Editor>, Entity<Buffer>>,
@@ -193,6 +248,7 @@ struct ReviewSession {
     undo_stack: Vec<Vec<ReviewUndo>>,
     scan_task: Option<Task<()>>,
     scan_again: bool,
+    status_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -201,6 +257,7 @@ impl ReviewSession {
         workspace: Entity<Workspace>,
         project: Entity<Project>,
         repo_root: PathBuf,
+        git_dir: PathBuf,
         base: String,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -208,7 +265,10 @@ impl ReviewSession {
             cx.new(|_| ActionLog::new(project.clone()).with_disk_changes_as_agent_edits());
         let buffer_store = project.read(cx).buffer_store().clone();
         let subscriptions = vec![
-            cx.observe(&action_log, |this, _, cx| this.update_editors(cx)),
+            cx.observe(&action_log, |this, _, cx| {
+                this.update_editors(cx);
+                this.schedule_status_write(cx);
+            }),
             cx.subscribe(&workspace, |this, _, event: &workspace::Event, cx| {
                 if let workspace::Event::ItemAdded { .. } = event {
                     this.update_editors(cx);
@@ -248,19 +308,108 @@ impl ReviewSession {
             workspace: workspace.downgrade(),
             project: project.clone(),
             repo_root,
+            git_dir,
             base,
             action_log,
             reviewing_editors: HashMap::default(),
             undo_stack: Vec::new(),
             scan_task: None,
             scan_again: false,
+            status_task: None,
             _subscriptions: subscriptions,
         };
         for buffer in project.read(cx).opened_buffers(cx) {
             this.track_buffer(buffer, cx);
         }
         this.schedule_scan(cx);
+        this.schedule_status_write(cx);
         this
+    }
+
+    /// Files with changes waiting for review, sorted by path, with their hunks.
+    fn pending_changes(&self, cx: &App) -> Vec<PendingChange> {
+        let mut changes = self
+            .action_log
+            .read(cx)
+            .changed_buffers(cx)
+            .filter(|(buffer, _)| buffer.read(cx).file().is_some())
+            .filter_map(|(buffer, diff)| {
+                let snapshot = buffer.read(cx).snapshot();
+                let hunk_ranges = diff
+                    .read(cx)
+                    .snapshot(cx)
+                    .hunks_intersecting_range(
+                        language::Anchor::min_max_range_for_buffer(snapshot.remote_id()),
+                        &snapshot,
+                    )
+                    .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                    .collect::<Vec<_>>();
+                (!hunk_ranges.is_empty()).then_some(PendingChange {
+                    buffer,
+                    diff,
+                    hunk_ranges,
+                })
+            })
+            .collect::<Vec<_>>();
+        changes.sort_by_cached_key(|change| {
+            change
+                .buffer
+                .read(cx)
+                .file()
+                .map(|file| file.path().clone())
+        });
+        changes
+    }
+
+    fn pending_counts(&self, cx: &App) -> PendingCounts {
+        let changes = self.pending_changes(cx);
+        PendingCounts {
+            files: changes.len(),
+            hunks: changes.iter().map(|change| change.hunk_ranges.len()).sum(),
+        }
+    }
+
+    fn status_file(&self) -> PathBuf {
+        self.git_dir.join(STATUS_FILE_NAME)
+    }
+
+    /// Writes the review's counts for other programs, such as bb, to show.
+    fn schedule_status_write(&mut self, cx: &mut Context<Self>) {
+        let status_file = self.status_file();
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_DELAY).await;
+            let Ok(status) = this.read_with(cx, |this, cx| {
+                let changes = this.pending_changes(cx);
+                let paths = changes
+                    .iter()
+                    .filter_map(|change| this.repo_path_for_buffer(&change.buffer, cx))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "repo": this.repo_root,
+                    "base": this.base,
+                    "files": changes.len(),
+                    "hunks": changes.iter().map(|change| change.hunk_ranges.len()).sum::<usize>(),
+                    "paths": paths,
+                })
+            }) else {
+                return;
+            };
+            cx.background_spawn(async move {
+                let temp_file = status_file.with_extension("json.tmp");
+                std::fs::write(&temp_file, status.to_string())?;
+                std::fs::rename(&temp_file, &status_file)?;
+                anyhow::Ok(())
+            })
+            .await
+            .log_err();
+        }));
+    }
+
+    fn remove_status_file(&mut self, cx: &mut Context<Self>) {
+        self.status_task = None;
+        let status_file = self.status_file();
+        cx.background_spawn(async move { std::fs::remove_file(status_file).ok() })
+            .detach();
     }
 
     /// Compares the repository with the base and tracks every changed file.
@@ -419,14 +568,13 @@ impl ReviewSession {
         }
     }
 
-    /// Undoes the latest keep or reject that touched `buffer`, if the buffer still has
-    /// the text that action left. Returns whether anything was undone.
-    fn undo_review(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) -> bool {
-        let Some(ix) = self
-            .undo_stack
-            .iter()
-            .rposition(|entries| entries.iter().any(|entry| &entry.buffer == buffer))
-        else {
+    /// Undoes the latest keep or reject that touched `buffer`, or the latest of all
+    /// without a buffer, if its buffers still have the text that action left. Returns
+    /// whether anything was undone.
+    fn undo_review(&mut self, buffer: Option<&Entity<Buffer>>, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.undo_stack.iter().rposition(|entries| {
+            buffer.is_none_or(|buffer| entries.iter().any(|entry| &entry.buffer == buffer))
+        }) else {
             return false;
         };
         let unchanged_since = self.undo_stack[ix]
@@ -477,8 +625,6 @@ fn reset_editor(editor: &WeakEntity<Editor>, cx: &mut App) {
         .ok();
 }
 
-/// Adds the `external_review` key context, so that review key bindings only apply to
-/// editors with external changes.
 /// What a keep or reject changed in one buffer, to undo it.
 struct ReviewUndo {
     buffer: Entity<Buffer>,
@@ -487,6 +633,8 @@ struct ReviewUndo {
     text_after: String,
 }
 
+/// Adds the `external_review` key context, so that review key bindings only apply to
+/// editors with external changes.
 struct ExternalReviewAddon;
 
 impl editor::Addon for ExternalReviewAddon {
@@ -519,11 +667,7 @@ fn review_active_editor(
         cx.propagate();
         return;
     };
-    if !session
-        .read(cx)
-        .reviewing_editors
-        .contains_key(&editor.downgrade())
-    {
+    if editor.read(cx).addon::<ExternalReviewAddon>().is_none() {
         cx.propagate();
         return;
     }
