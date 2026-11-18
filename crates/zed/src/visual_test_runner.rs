@@ -1740,7 +1740,7 @@ fn run_external_review_visual_tests(
         cx.run_until_parked();
         anyhow::Ok(())
     };
-    dispatch(Box::new(external_review::OpenReview), cx)?;
+    dispatch(Box::new(external_review::OpenReviewTab), cx)?;
     pump(cx)?;
     let pane_is_active = cx.read(|cx| {
         workspace
@@ -1748,7 +1748,7 @@ fn run_external_review_visual_tests(
             .active_item(cx)
             .is_some_and(|item| item.downcast::<external_review::ReviewPane>().is_some())
     });
-    anyhow::ensure!(pane_is_active, "OpenReview did not show the Review tab");
+    anyhow::ensure!(pane_is_active, "OpenReviewTab did not show the Review tab");
     anyhow::ensure!(
         external_review_hunk_count(&workspace, cx) == 5,
         "the Review tab should show the 4 hunks of app.py and the new notes.md, got {}",
@@ -1786,6 +1786,51 @@ fn run_external_review_visual_tests(
     anyhow::ensure!(
         external_review_hunk_count(&workspace, cx) == 5,
         "undoing Keep All did not bring the hunks back"
+    );
+
+    // The same review in the right dock, opened the way cmd-shift-b does, where
+    // keep works on the hunk at the cursor.
+    workspace_window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            let weak_workspace = workspace.weak_handle();
+            let project = workspace.project().clone();
+            let panel = cx.new(|cx| {
+                external_review::ReviewPanel::new(weak_workspace, project, window, cx)
+            });
+            workspace.add_panel(panel, window, cx);
+        })
+    })?;
+    dispatch(Box::new(external_review::ToggleFocus), cx)?;
+    pump(cx)?;
+    let panel_open = cx.read(|cx| {
+        workspace
+            .read(cx)
+            .panel::<external_review::ReviewPanel>(cx)
+            .is_some_and(|panel| workspace.read(cx).right_dock().read(cx).is_open() && {
+                let _ = panel;
+                true
+            })
+    });
+    anyhow::ensure!(panel_open, "ToggleFocus did not open the review panel on the right");
+    results.push(run_visual_test(
+        "external_review_panel",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+    let pending_hunks = || -> Result<serde_json::Value> {
+        let status: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            project_path.join(".git/zed-review.json"),
+        )?)?;
+        Ok(status["hunks"].clone())
+    };
+    anyhow::ensure!(pending_hunks()? == 5, "expected 5 pending hunks before keeping in the panel");
+    cx.simulate_keystrokes(workspace_window.into(), "cmd-y");
+    pump(cx)?;
+    anyhow::ensure!(
+        pending_hunks()? == 4,
+        "cmd-y in the panel did not keep a hunk, pending: {}",
+        pending_hunks()?
     );
 
     Ok(results

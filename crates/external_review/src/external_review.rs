@@ -10,8 +10,10 @@
 //! `zed-review.json` in the repository's git directory, for other programs to show.
 
 mod review_pane;
+mod review_panel;
 
 pub use review_pane::{PendingCounts, ReviewIndicator, ReviewPane};
+pub use review_panel::ReviewPanel;
 
 use action_log::ActionLog;
 use anyhow::{Context as _, Result};
@@ -43,8 +45,12 @@ actions!(
     [
         /// Starts or stops reviewing changes that other programs make to the project.
         Toggle,
-        /// Opens the tab with every change waiting for review.
+        /// Opens the panel with every change waiting for review.
         OpenReview,
+        /// Opens every change waiting for review in a tab.
+        OpenReviewTab,
+        /// Opens or closes the review panel.
+        ToggleFocus,
         /// Keeps the external changes in the selected hunks.
         Keep,
         /// Rejects the external changes in the selected hunks, restoring the base text.
@@ -81,7 +87,13 @@ pub fn init(cx: &mut App) {
             }
         });
         workspace.register_action(|workspace, _: &OpenReview, window, cx| {
+            workspace.focus_panel::<ReviewPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenReviewTab, window, cx| {
             ReviewPane::deploy(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+            workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &Keep, _, cx| {
             review_active_editor(workspace, ReviewKind::Keep, false, cx);

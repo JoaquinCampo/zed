@@ -2,8 +2,8 @@
 //! counts them.
 
 use crate::{
-    ExternalReviewAddon, KeepAll, OpenReview, RejectAll, ReviewHunkRenderer, ReviewKind,
-    ReviewSession, ReviewSessions, review_ranges, session_for,
+    ExternalReviewAddon, Keep, KeepAll, OpenReview, Reject, RejectAll, ReviewHunkRenderer,
+    ReviewKind, ReviewSession, ReviewSessions, Undo, review_ranges, session_for,
 };
 use anyhow::Result;
 use collections::HashSet;
@@ -76,7 +76,7 @@ impl ReviewPane {
         workspace.add_item_to_center(Box::new(pane), window, cx);
     }
 
-    fn new(
+    pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         window: &mut Window,
@@ -213,6 +213,37 @@ impl ReviewPane {
         });
     }
 
+    /// The focus handle of the whole view, which contains the editor's.
+    pub(crate) fn root_focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// Keeps or rejects the hunks at the cursors. Inside a dock panel the workspace's
+    /// active item is another editor, so the review handles these keys itself.
+    fn review_selection(&mut self, kind: ReviewKind, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            cx.propagate();
+            return;
+        };
+        let reviewed = self.editor.update(cx, |editor, cx| {
+            let ranges = editor.selections.disjoint_anchor_ranges().collect();
+            review_ranges(editor, &session, kind, ranges, cx)
+        });
+        if !reviewed {
+            cx.propagate();
+        }
+    }
+
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        let undone = self
+            .session
+            .clone()
+            .is_some_and(|session| session.update(cx, |session, cx| session.undo_review(None, cx)));
+        if !undone {
+            cx.propagate();
+        }
+    }
+
     fn counts(&self, cx: &App) -> PendingCounts {
         self.session
             .as_ref()
@@ -328,6 +359,19 @@ impl Render for ReviewPane {
         v_flex()
             .track_focus(&self.focus_handle)
             .key_context("ExternalReviewPane")
+            .on_action(cx.listener(|this, _: &Keep, _, cx| {
+                this.review_selection(ReviewKind::Keep, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Reject, _, cx| {
+                this.review_selection(ReviewKind::Reject, cx)
+            }))
+            .on_action(cx.listener(|this, _: &KeepAll, _, cx| {
+                this.review_all(ReviewKind::Keep, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RejectAll, _, cx| {
+                this.review_all(ReviewKind::Reject, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
             .size_full()
             .child(self.render_header(counts, cx))
             .child(if is_empty {
