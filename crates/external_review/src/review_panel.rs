@@ -1,17 +1,29 @@
-//! A dock panel, on the right by default, that shows the review: every change still
+//! A dock panel, on the left by default, that shows the review: every change still
 //! waiting for review, with keep and reject on each hunk.
 
 use crate::{ReviewPane, ReviewSessions, ToggleFocus, session_for};
 use anyhow::Result;
+use db::kvp::KeyValueStore;
 use gpui::{
     Action, App, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
     Subscription, WeakEntity, Window, px,
 };
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
+
+/// Where the panel was last docked, kept across restarts.
+const POSITION_KEY: &str = "external_review_panel_position";
+
+fn saved_position(cx: &App) -> DockPosition {
+    match KeyValueStore::global(cx).read_kvp(POSITION_KEY).log_err().flatten().as_deref() {
+        Some("right") => DockPosition::Right,
+        _ => DockPosition::Left,
+    }
+}
 
 pub struct ReviewPanel {
     workspace: WeakEntity<Workspace>,
@@ -42,7 +54,7 @@ impl ReviewPanel {
         Self {
             workspace,
             review,
-            position: DockPosition::Right,
+            position: saved_position(cx),
             // The dock button shows only while a review runs.
             _subscription: cx.observe_global::<ReviewSessions>(|_, cx| cx.notify()),
         }
@@ -90,6 +102,17 @@ impl Panel for ReviewPanel {
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         self.position = position;
+        let value = match position {
+            DockPosition::Right => "right",
+            DockPosition::Left | DockPosition::Bottom => "left",
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            kvp.write_kvp(POSITION_KEY.to_string(), value.to_string())
+                .await
+                .log_err();
+        })
+        .detach();
         cx.notify();
     }
 

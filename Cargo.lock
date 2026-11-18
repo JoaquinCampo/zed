@@ -6149,6 +6149,7 @@ dependencies = [
  "anyhow",
  "buffer_diff",
  "collections",
+ "db",
  "editor",
  "gpui",
  "language",

@@ -1788,7 +1788,7 @@ fn run_external_review_visual_tests(
         "undoing Keep All did not bring the hunks back"
     );
 
-    // The same review in the right dock, opened the way cmd-shift-b does, where
+    // The same review in the left dock, opened the way cmd-shift-b does, where
     // keep works on the hunk at the cursor.
     workspace_window.update(cx, |_, window, cx| {
         workspace.update(cx, |workspace, cx| {
@@ -1806,12 +1806,12 @@ fn run_external_review_visual_tests(
         workspace
             .read(cx)
             .panel::<external_review::ReviewPanel>(cx)
-            .is_some_and(|panel| workspace.read(cx).right_dock().read(cx).is_open() && {
+            .is_some_and(|panel| workspace.read(cx).left_dock().read(cx).is_open() && {
                 let _ = panel;
                 true
             })
     });
-    anyhow::ensure!(panel_open, "ToggleFocus did not open the review panel on the right");
+    anyhow::ensure!(panel_open, "ToggleFocus did not open the review panel on the left");
     results.push(run_visual_test(
         "external_review_panel",
         workspace_window.into(),
@@ -1832,6 +1832,13 @@ fn run_external_review_visual_tests(
         "cmd-y in the panel did not keep a hunk, pending: {}",
         pending_hunks()?
     );
+
+    // Toggling again closes the panel, even while it has focus.
+    dispatch(Box::new(external_review::ToggleFocus), cx)?;
+    pump(cx)?;
+    let right_dock_open =
+        cx.read(|cx| workspace.read(cx).left_dock().read(cx).is_open());
+    anyhow::ensure!(!right_dock_open, "ToggleFocus did not close the review panel");
 
     Ok(results
         .into_iter()

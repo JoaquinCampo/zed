@@ -38,7 +38,7 @@ use std::{
 use text::{LineEnding, Rope};
 use ui::{KeyBinding, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::Workspace;
+use workspace::{Workspace, dock::Panel as _};
 
 actions!(
     external_review,
@@ -93,7 +93,21 @@ pub fn init(cx: &mut App) {
             ReviewPane::deploy(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
+            // Opens the panel when it is hidden and closes it when it is showing,
+            // wherever the focus is.
+            let showing = workspace.panel::<ReviewPanel>(cx).is_some_and(|panel| {
+                let position = panel.read(cx).position(window, cx);
+                workspace
+                    .dock_at_position(position)
+                    .read(cx)
+                    .visible_panel()
+                    .is_some_and(|visible| visible.panel_id() == panel.entity_id())
+            });
+            if showing {
+                workspace.close_panel::<ReviewPanel>(window, cx);
+            } else {
+                workspace.focus_panel::<ReviewPanel>(window, cx);
+            }
         });
         workspace.register_action(|workspace, _: &Keep, _, cx| {
             review_active_editor(workspace, ReviewKind::Keep, false, cx);
