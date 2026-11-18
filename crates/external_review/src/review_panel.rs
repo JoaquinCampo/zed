@@ -29,6 +29,10 @@ pub struct ReviewPanel {
     workspace: WeakEntity<Workspace>,
     review: Entity<ReviewPane>,
     position: DockPosition,
+    /// The dock's panel before the review opened, shown again once it closes.
+    return_to: Option<&'static str>,
+    /// Whether the review is showing because it was asked for.
+    requested: bool,
     _subscription: Subscription,
 }
 
@@ -55,6 +59,8 @@ impl ReviewPanel {
             workspace,
             review,
             position: saved_position(cx),
+            return_to: None,
+            requested: false,
             // The dock button shows only while a review runs.
             _subscription: cx.observe_global::<ReviewSessions>(|_, cx| cx.notify()),
         }
@@ -63,6 +69,25 @@ impl ReviewPanel {
     fn is_reviewing(&self, cx: &App) -> bool {
         session_for(self.workspace.entity_id(), cx).is_some()
     }
+}
+
+/// Shows the review panel on purpose, remembering the dock's panel to go back to.
+pub fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(panel) = workspace.panel::<ReviewPanel>(cx) {
+        let position = panel.read(cx).position;
+        let dock = workspace.dock_at_position(position).read(cx);
+        let previous = dock
+            .active_panel()
+            .filter(|active| active.panel_id() != panel.entity_id())
+            .map(|active| active.persistent_name());
+        panel.update(cx, |panel, _| {
+            if previous.is_some() {
+                panel.return_to = previous;
+            }
+            panel.requested = true;
+        });
+    }
+    workspace.focus_panel::<ReviewPanel>(window, cx);
 }
 
 impl EventEmitter<PanelEvent> for ReviewPanel {}
@@ -138,6 +163,52 @@ impl Panel for ReviewPanel {
 
     fn toggle_action(&self) -> Box<dyn Action> {
         ToggleFocus.boxed_clone()
+    }
+
+    /// The review shows only when asked for (cmd-shift-b, its dock button, bb, the
+    /// command palette). When its dock is toggled instead (cmd-b), the dock shows
+    /// its panel from before the review, or closes if the review is its only panel.
+    /// After the review closes, that earlier panel is made the dock's active one
+    /// again, so toggling the dock brings it back.
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Showing a panel activates it more than once, so the request lasts until
+        // the review closes.
+        if active && self.requested {
+            return;
+        }
+        if !active {
+            self.requested = false;
+        }
+        let workspace = self.workspace.clone();
+        let position = self.position;
+        let return_to = self.return_to;
+        let panel_id = cx.entity_id();
+        // Called while the dock is being updated, so look at it afterwards.
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            let dock = workspace.read(cx).dock_at_position(position).clone();
+            dock.update(cx, |dock, cx| {
+                let review_is_active = dock
+                    .active_panel()
+                    .is_some_and(|panel| panel.panel_id() == panel_id);
+                // Closed after being shown, or shown without being asked for.
+                if !review_is_active || dock.is_open() != active {
+                    return;
+                }
+                let review_index = dock.active_panel_index();
+                let other = return_to
+                    .and_then(|name| dock.panel_index_for_persistent_name(name, cx))
+                    .or_else(|| dock.first_enabled_panel_idx(cx).ok())
+                    .filter(|index| Some(*index) != review_index);
+                match other {
+                    Some(index) => dock.activate_panel(index, window, cx),
+                    None if active => dock.set_open(false, window, cx),
+                    None => {}
+                }
+            });
+        });
     }
 
     fn activation_priority(&self) -> u32 {

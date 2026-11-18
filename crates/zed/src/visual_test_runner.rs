@@ -1788,6 +1788,32 @@ fn run_external_review_visual_tests(
         "undoing Keep All did not bring the hunks back"
     );
 
+    // Another panel shares the review's dock, as the agent panel does in a real setup.
+    cx.update(|cx| {
+        gpui::BorrowAppContext::update_global::<settings::SettingsStore, _>(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project_panel.get_or_insert_default().dock =
+                    Some(settings::DockSide::Left);
+            })
+        })
+    });
+    let (weak_workspace, async_window_cx) = workspace_window.update(cx, |_, window, cx| {
+        (workspace.downgrade(), window.to_async(cx))
+    })?;
+    cx.background_executor.allow_parking();
+    let project_panel = cx
+        .foreground_executor
+        .block_test(ProjectPanel::load(weak_workspace, async_window_cx))?;
+    cx.background_executor.forbid_parking();
+    workspace_window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_panel(project_panel, window, cx);
+            workspace.open_panel::<ProjectPanel>(window, cx);
+            workspace.close_panel::<ProjectPanel>(window, cx);
+        })
+    })?;
+    cx.run_until_parked();
+
     // The same review in the left dock, opened the way cmd-shift-b does, where
     // keep works on the hunk at the cursor.
     workspace_window.update(cx, |_, window, cx| {
@@ -1839,6 +1865,18 @@ fn run_external_review_visual_tests(
     let right_dock_open =
         cx.read(|cx| workspace.read(cx).left_dock().read(cx).is_open());
     anyhow::ensure!(!right_dock_open, "ToggleFocus did not close the review panel");
+
+    // Toggling the left dock (cmd-b) then shows the file tree, not the review.
+    dispatch(Box::new(workspace::ToggleLeftDock), cx)?;
+    pump(cx)?;
+    let file_tree_showing = cx.read(|cx| {
+        let dock = workspace.read(cx).left_dock().read(cx);
+        dock.is_open()
+            && dock
+                .visible_panel()
+                .is_some_and(|panel| panel.persistent_name() == "Project Panel")
+    });
+    anyhow::ensure!(file_tree_showing, "cmd-b showed the review instead of the file tree");
 
     Ok(results
         .into_iter()

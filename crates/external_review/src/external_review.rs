@@ -13,7 +13,7 @@ mod review_pane;
 mod review_panel;
 
 pub use review_pane::{PendingCounts, ReviewIndicator, ReviewPane};
-pub use review_panel::ReviewPanel;
+pub use review_panel::{ReviewPanel, show as show_panel};
 
 use action_log::ActionLog;
 use anyhow::{Context as _, Result};
@@ -87,7 +87,7 @@ pub fn init(cx: &mut App) {
             }
         });
         workspace.register_action(|workspace, _: &OpenReview, window, cx| {
-            workspace.focus_panel::<ReviewPanel>(window, cx);
+            review_panel::show(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &OpenReviewTab, window, cx| {
             ReviewPane::deploy(workspace, window, cx);
@@ -106,7 +106,7 @@ pub fn init(cx: &mut App) {
             if showing {
                 workspace.close_panel::<ReviewPanel>(window, cx);
             } else {
-                workspace.focus_panel::<ReviewPanel>(window, cx);
+                review_panel::show(workspace, window, cx);
             }
         });
         workspace.register_action(|workspace, _: &Keep, _, cx| {

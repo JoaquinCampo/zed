@@ -1743,7 +1743,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     if open {
                         window.update(cx, |multi_workspace, window, cx| {
                             multi_workspace.workspace().clone().update(cx, |workspace, cx| {
-                                workspace.focus_panel::<external_review::ReviewPanel>(window, cx);
+                                external_review::show_panel(workspace, window, cx);
                             });
                             window.activate_window();
                         })?;
