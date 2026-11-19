@@ -1497,6 +1497,23 @@ fn show_toast_in_active_workspace(message: &str, cx: &mut App) -> bool {
     false
 }
 
+/// The workspace of an open window that has `path` inside one of its folders.
+fn workspace_showing_path(path: &Path, cx: &App) -> Option<gpui::Entity<workspace::Workspace>> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .filter_map(|window| window.read(cx).ok())
+        .flat_map(|multi_workspace| multi_workspace.workspaces().cloned().collect::<Vec<_>>())
+        .find(|workspace| {
+            workspace.read(cx).visible_worktrees(cx).any(|worktree| {
+                let root = worktree.read(cx).abs_path();
+                let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+                path.starts_with(&root) || root.starts_with(&path)
+            })
+        })
+}
+
 fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut App) {
     if let Some(kind) = request.kind {
         match kind {
@@ -1713,6 +1730,33 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 // Review the repository in the window that already has it open.
                 base_open_options.workspace_matching = workspace::WorkspaceMatching::MatchExact;
                 let review_path = request.open_paths.first().map(PathBuf::from);
+                // Links that only start, restart or stop a review (sent by other
+                // programs at every turn) act on a window that already has the folder,
+                // without opening anything or bringing Zed to the front.
+                if !open {
+                    let workspace = review_path
+                        .as_deref()
+                        .and_then(|path| workspace_showing_path(path, cx));
+                    match workspace {
+                        Some(workspace) if enable => {
+                            let project = workspace.read(cx).project().clone();
+                            external_review::start(
+                                workspace.downgrade(),
+                                project,
+                                review_path,
+                                base,
+                                fresh,
+                                cx,
+                            )
+                            .detach_and_log_err(cx);
+                        }
+                        Some(workspace) => external_review::stop(workspace.entity_id(), cx),
+                        None => log::info!(
+                            "no window shows {review_path:?}; review starts when it is opened"
+                        ),
+                    }
+                    return;
+                }
                 cx.spawn(async move |cx| {
                     let paths_with_position =
                         derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
