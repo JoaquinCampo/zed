@@ -335,12 +335,14 @@ mod tests {
     #[test]
     fn test_snapshot_folder_with_repositories() {
         static DATA_DIR: std::sync::Once = std::sync::Once::new();
-        let data = tempfile::tempdir().unwrap().keep();
+        // The data directory is set once per process, so it outlives this test.
         DATA_DIR.call_once(|| {
-            paths::set_custom_data_dir(data.to_str().unwrap());
+            let data = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+            paths::set_custom_data_dir(data.path().to_str().unwrap());
         });
 
-        let folder = tempfile::tempdir().unwrap().keep();
+        let folder_dir = tempfile::tempdir().unwrap();
+        let folder = folder_dir.path().to_path_buf();
         let write = |path: &str, text: &str| {
             let path = folder.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
