@@ -3,7 +3,11 @@
 # /Applications/Zed.app, so it uses the usual settings, extensions and recent
 # projects. The app that was there is kept next to it as a backup, and its
 # bundle (Info.plist, icons, the bundled git, frameworks) is reused around the new
-# binaries. Signed ad hoc, without the entitlements that need Zed's team key.
+# binaries. Signed with the local "Zed Local Signing" certificate when the login
+# keychain has it (ad hoc otherwise), without the entitlements that need Zed's team
+# key. A fixed certificate keeps the app's identity the same across builds, so the
+# keychain's "Always Allow" for Zed's saved logins keeps working after a rebuild;
+# with ad hoc signing every build is a new app and macOS asks again.
 #
 # Usage: script/install-local-release   (SKIP_BUILD=1 to reuse the last build)
 
@@ -27,7 +31,7 @@ fi
 template="$app"
 installed_version=$(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString)
 backup="$HOME/Applications/Zed-${installed_version}-backup.app"
-if ! codesign -dv "$app" 2>&1 | grep -q "Signature=adhoc"; then
+if codesign -dvv "$app" 2>&1 | grep -q "Authority=Developer ID Application"; then
     # The app in place is an official build: keep it as the backup and template.
     mkdir -p "$HOME/Applications"
     if [[ ! -d "$backup" ]]; then
@@ -46,7 +50,11 @@ cp "$target_dir/cli" "$staging/Contents/MacOS/cli"
 entitlements=$(mktemp)
 sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$entitlements"
 rm -f "$staging/Contents/embedded.provisionprofile"
-codesign --force --deep --entitlements "$entitlements" --sign - "$staging"
+identity=-
+if security find-identity 2>/dev/null | grep -q '"Zed Local Signing"'; then
+    identity="Zed Local Signing"
+fi
+codesign --force --deep --entitlements "$entitlements" --sign "$identity" "$staging"
 
 if pgrep -xf "$app/Contents/MacOS/zed" > /dev/null; then
     echo "Quit Zed before installing" >&2
