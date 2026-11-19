@@ -83,8 +83,10 @@ pub enum OpenRequestKind {
     /// Starts or stops reviewing external changes in the repository of the opened path.
     ExternalReview {
         enable: bool,
-        /// Whether to show the Review tab and bring its window to the front.
+        /// Whether to show the review and bring its window to the front.
         open: bool,
+        /// Whether to start over from the folder's current state.
+        fresh: bool,
         /// Git tree or commit to diff against. Defaults to the repository's current state.
         base: Option<String>,
     },
@@ -126,10 +128,16 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
-            Self::ExternalReview { enable, open, base } => f
+            Self::ExternalReview {
+                enable,
+                open,
+                fresh,
+                base,
+            } => f
                 .debug_struct("ExternalReview")
                 .field("enable", enable)
                 .field("open", open)
+                .field("fresh", fresh)
                 .field("base", base)
                 .finish(),
         }
@@ -307,15 +315,19 @@ impl OpenRequest {
 
     fn parse_external_review_url(&mut self, review_path: &str) -> Result<()> {
         // Format: on?path=<path>[&base=<tree or commit>], open?path=<path>[&base=...]
-        // (starts the review if it is not running and shows the Review tab), or off?path=<path>
+        // (starts the review if it is not running and shows it), restart?path=<path>
+        // (starts over from the folder's current state), or off?path=<path>
         let (command, query) = review_path
             .split_once('?')
             .context("invalid review url: missing query string")?;
-        let (enable, open) = match command {
-            "on" => (true, false),
-            "open" => (true, true),
-            "off" => (false, false),
-            _ => anyhow::bail!("invalid review url: expected on, open or off, got {command:?}"),
+        let (enable, open, fresh) = match command {
+            "on" => (true, false, false),
+            "open" => (true, true, false),
+            "restart" => (true, false, true),
+            "off" => (false, false, false),
+            _ => anyhow::bail!(
+                "invalid review url: expected on, open, restart or off, got {command:?}"
+            ),
         };
         let mut path = None;
         let mut base = None;
@@ -329,7 +341,12 @@ impl OpenRequest {
         let path = path.context("invalid review url: missing path query parameter")?;
 
         self.open_paths.push(path);
-        self.kind = Some(OpenRequestKind::ExternalReview { enable, open, base });
+        self.kind = Some(OpenRequestKind::ExternalReview {
+            enable,
+            open,
+            fresh,
+            base,
+        });
 
         Ok(())
     }

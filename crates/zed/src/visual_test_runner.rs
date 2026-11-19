@@ -1590,6 +1590,7 @@ fn run_external_review_visual_tests(
             project,
             Some(project_path.clone()),
             None,
+            false,
             cx,
         )
     });
@@ -1755,7 +1756,7 @@ fn run_external_review_visual_tests(
         external_review_hunk_count(&workspace, cx)
     );
     let status: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-        project_path.join(".git/zed-review.json"),
+        external_review::status_file_for(&project_path),
     )?)?;
     anyhow::ensure!(
         status["files"] == 2 && status["hunks"] == 5,
@@ -1850,7 +1851,7 @@ fn run_external_review_visual_tests(
     )?);
     let pending_hunks = || -> Result<serde_json::Value> {
         let status: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            project_path.join(".git/zed-review.json"),
+            external_review::status_file_for(&project_path),
         )?)?;
         Ok(status["hunks"].clone())
     };

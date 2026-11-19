@@ -7,13 +7,16 @@
 //!
 //! The Review tab lists every change still waiting for review, and a status bar
 //! item counts them. While a review runs, its counts are also written to
-//! `zed-review.json` in the repository's git directory, for other programs to show.
+//! `status.json` in the review's snapshot store (see `snapshot.rs`), for other
+//! programs to show.
 
 mod review_pane;
+mod snapshot;
 mod review_panel;
 
 pub use review_pane::{PendingCounts, ReviewIndicator, ReviewPane};
 pub use review_panel::{ReviewPanel, show as show_panel};
+use snapshot::SnapshotStore;
 
 use action_log::ActionLog;
 use anyhow::{Context as _, Result};
@@ -29,13 +32,10 @@ use project::{Project, buffer_store::BufferStoreEvent};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
-use text::{LineEnding, Rope};
+use text::Rope;
 use ui::{KeyBinding, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{Workspace, dock::Panel as _};
@@ -72,8 +72,6 @@ const SCAN_DELAY: Duration = Duration::from_millis(150);
 /// How long to wait after a review change before writing the status file.
 const STATUS_DELAY: Duration = Duration::from_millis(200);
 
-/// Name of the file in the git directory that holds the running review's counts.
-const STATUS_FILE_NAME: &str = "zed-review.json";
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -83,7 +81,7 @@ pub fn init(cx: &mut App) {
                 stop(workspace_id, cx);
             } else {
                 let project = workspace.project().clone();
-                start(cx.weak_entity(), project, None, None, cx).detach_and_log_err(cx);
+                start(cx.weak_entity(), project, None, None, false, cx).detach_and_log_err(cx);
             }
         });
         workspace.register_action(|workspace, _: &OpenReview, window, cx| {
@@ -158,22 +156,30 @@ fn session_for(workspace_id: EntityId, cx: &App) -> Option<Entity<ReviewSession>
         .cloned()
 }
 
+/// Where a review of `root` writes its counts while it runs.
+pub fn status_file_for(root: &Path) -> PathBuf {
+    SnapshotStore::dir_for(root).join("status.json")
+}
+
 pub fn is_active(workspace_id: EntityId, cx: &App) -> bool {
     session_for(workspace_id, cx).is_some()
 }
 
-/// Starts reviewing external changes in the git repository containing `path`, or the
-/// repository of the workspace's first worktree. `base` is a git tree or commit to diff
-/// against; without it, the repository's current state (including untracked files) is used.
-/// Starting again with the same repository and base keeps the running review, with
-/// what was kept and the undo history; anything else replaces it. Safe to call while
-/// the workspace is being updated, since the workspace is only used once the review
-/// is ready.
+/// Starts reviewing external changes in the folder `path` (or its parent, for a
+/// file), or in the workspace's first worktree. The folder does not have to be a git
+/// repository: its snapshots live in a store of the review's own. `base` is a
+/// snapshot taken earlier to diff against; without it, or when the store no longer
+/// has it, the folder's current state is used. Starting again with the same folder
+/// and base, or without a base, keeps the running review, with what was kept and
+/// the undo history, unless `fresh` asks for a new snapshot. Safe to call while the
+/// workspace is being updated, since the workspace is only used once the review is
+/// ready.
 pub fn start(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     path: Option<PathBuf>,
     base: Option<String>,
+    fresh: bool,
     cx: &mut App,
 ) -> Task<Result<()>> {
     let path = path.or_else(|| {
@@ -193,45 +199,48 @@ pub fn start(
         .collect::<Vec<_>>();
     let workspace_id = workspace.entity_id();
     cx.spawn(async move |cx| {
-        let (repo_root, git_dir) = cx
-            .background_spawn(async move {
-                let repo_root = repository_root(&path, &worktree_roots).await?;
-                let git_dir =
-                    PathBuf::from(git_line(&repo_root, &["rev-parse", "--absolute-git-dir"]).await?);
-                anyhow::Ok((repo_root, git_dir))
-            })
-            .await?;
+        let root = review_root(&path, &worktree_roots)?;
         let running_base = cx.update(|cx| {
             session_for(workspace_id, cx)
                 .map(|session| session.read(cx))
-                .filter(|session| session.repo_root == repo_root)
+                .filter(|session| session.root == root)
                 .map(|session| session.base.clone())
         });
-        let base = match (base, running_base) {
-            // Without a base, a running review of the same repository goes on.
-            (None, Some(_)) => return Ok(()),
-            (Some(base), running_base) => {
-                let repo_root = repo_root.clone();
-                let base = cx
-                    .background_spawn(async move { resolve_tree(&repo_root, &base).await })
-                    .await?;
-                if running_base.as_ref() == Some(&base) {
-                    return Ok(());
+        if running_base.is_some() && base.is_none() && !fresh {
+            return Ok(());
+        }
+        let (store, base) = cx
+            .background_spawn({
+                let root = root.clone();
+                async move {
+                    let store = SnapshotStore::open(root).await?;
+                    let resolved = match base.filter(|_| !fresh) {
+                        Some(base) => match store.resolve(&base).await {
+                            Ok(tree) => Some(tree),
+                            Err(_) => {
+                                log::warn!("review base {base} is gone, starting from now");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let base = match resolved {
+                        Some(base) => base,
+                        None => store.snapshot().await?,
+                    };
+                    anyhow::Ok((Arc::new(store), base))
                 }
-                base
-            }
-            (None, None) => {
-                let repo_root = repo_root.clone();
-                cx.background_spawn(async move { snapshot_tree(&repo_root).await })
-                    .await?
-            }
-        };
+            })
+            .await?;
+        if !fresh && running_base.as_ref() == Some(&base) {
+            return Ok(());
+        }
         let workspace = workspace.upgrade().context("workspace was closed")?;
         cx.update(|cx| {
             stop(workspace.entity_id(), cx);
-            log::info!("external review started in {repo_root:?} against {base}");
+            log::info!("external review started in {root:?} against {base}");
             let session = cx.new(|cx| {
-                ReviewSession::new(workspace.clone(), project, repo_root, git_dir, base, cx)
+                ReviewSession::new(workspace.clone(), project, root, store, base, cx)
             });
             cx.default_global::<ReviewSessions>()
                 .0
@@ -264,8 +273,8 @@ struct PendingChange {
 struct ReviewSession {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    repo_root: PathBuf,
-    git_dir: PathBuf,
+    root: PathBuf,
+    store: Arc<SnapshotStore>,
     base: String,
     action_log: Entity<ActionLog>,
     reviewing_editors: HashMap<WeakEntity<Editor>, Entity<Buffer>>,
@@ -282,8 +291,8 @@ impl ReviewSession {
     fn new(
         workspace: Entity<Workspace>,
         project: Entity<Project>,
-        repo_root: PathBuf,
-        git_dir: PathBuf,
+        root: PathBuf,
+        store: Arc<SnapshotStore>,
         base: String,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -333,8 +342,8 @@ impl ReviewSession {
         let mut this = Self {
             workspace: workspace.downgrade(),
             project: project.clone(),
-            repo_root,
-            git_dir,
+            root,
+            store,
             base,
             action_log,
             reviewing_editors: HashMap::default(),
@@ -396,7 +405,7 @@ impl ReviewSession {
     }
 
     fn status_file(&self) -> PathBuf {
-        self.git_dir.join(STATUS_FILE_NAME)
+        self.store.status_file()
     }
 
     /// Writes the review's counts for other programs, such as bb, to show.
@@ -411,7 +420,7 @@ impl ReviewSession {
                     .filter_map(|change| this.repo_path_for_buffer(&change.buffer, cx))
                     .collect::<Vec<_>>();
                 serde_json::json!({
-                    "repo": this.repo_root,
+                    "repo": this.root,
                     "base": this.base,
                     "files": changes.len(),
                     "hunks": changes.iter().map(|change| change.hunk_ranges.len()).sum::<usize>(),
@@ -444,12 +453,12 @@ impl ReviewSession {
             self.scan_again = true;
             return;
         }
-        let repo_root = self.repo_root.clone();
+        let store = self.store.clone();
         let base = self.base.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SCAN_DELAY).await;
             let changes = cx
-                .background_spawn(async move { changed_paths(&repo_root, &base).await })
+                .background_spawn(async move { store.changed_paths(&base).await })
                 .await;
             this.update(cx, |this, cx| {
                 this.scan_task = None;
@@ -470,7 +479,7 @@ impl ReviewSession {
     }
 
     fn track_repo_path(&mut self, repo_path: String, cx: &mut Context<Self>) {
-        let abs_path = self.repo_root.join(&repo_path);
+        let abs_path = self.root.join(&repo_path);
         let Some(project_path) = self.project.read(cx).find_project_path(&abs_path, cx) else {
             return;
         };
@@ -491,11 +500,11 @@ impl ReviewSession {
         let Some(repo_path) = self.repo_path_for_buffer(&buffer, cx) else {
             return;
         };
-        let repo_root = self.repo_root.clone();
+        let store = self.store.clone();
         let base = self.base.clone();
         cx.spawn(async move |this, cx| {
             let base_text = cx
-                .background_spawn(async move { base_text(&repo_root, &base, &repo_path).await })
+                .background_spawn(async move { store.base_text(&base, &repo_path).await })
                 .await?;
             this.update(cx, |this, cx| {
                 this.action_log.update(cx, |action_log, cx| {
@@ -508,7 +517,7 @@ impl ReviewSession {
 
     fn repo_path_for_buffer(&self, buffer: &Entity<Buffer>, cx: &App) -> Option<String> {
         let abs_path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
-        let repo_path = abs_path.strip_prefix(&self.repo_root).ok()?;
+        let repo_path = abs_path.strip_prefix(&self.root).ok()?;
         let repo_path = repo_path.to_str()?;
         (!repo_path.is_empty()).then(|| repo_path.replace('\\', "/"))
     }
@@ -854,137 +863,33 @@ impl DiffHunkRenderer for ReviewHunkRenderer {
     }
 }
 
-async fn git(repo: &Path, args: &[&str], index_file: Option<&Path>) -> Result<Vec<u8>> {
-    let mut command = util::command::new_command("git");
-    command.current_dir(repo).args(args);
-    if let Some(index_file) = index_file {
-        command.env("GIT_INDEX_FILE", index_file);
-    }
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("running git {}", args.join(" ")))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
-}
-
-async fn git_line(repo: &Path, args: &[&str]) -> Result<String> {
-    let stdout = git(repo, args, None).await?;
-    Ok(String::from_utf8(stdout)?.trim().to_string())
-}
-
-/// Returns the root of the repository containing `path`, written relative to one of the
-/// project's worktree roots, so it can be compared with the paths of the project's files
-/// even when symlinks lead to the same directory (`/tmp` is `/private/tmp` on macOS).
-async fn repository_root(path: &Path, worktree_roots: &[PathBuf]) -> Result<PathBuf> {
+/// The folder to review for `path`, written relative to one of the project's worktree
+/// roots, so it can be compared with the paths of the project's files even when
+/// symlinks lead to the same directory (`/tmp` is `/private/tmp` on macOS).
+fn review_root(path: &Path, worktree_roots: &[PathBuf]) -> Result<PathBuf> {
     let directory = if path.is_dir() {
         path
     } else {
         path.parent().context("path has no parent directory")?
     };
-    let top_level = PathBuf::from(git_line(directory, &["rev-parse", "--show-toplevel"]).await?);
-    let Ok(real_top_level) = top_level.canonicalize() else {
-        return Ok(top_level);
+    let Ok(real_directory) = directory.canonicalize() else {
+        return Ok(directory.to_path_buf());
     };
     for worktree_root in worktree_roots {
         let Ok(real_worktree_root) = worktree_root.canonicalize() else {
             continue;
         };
-        // The repository is inside the worktree.
-        if let Ok(inside) = real_top_level.strip_prefix(&real_worktree_root) {
+        // The folder is inside the worktree.
+        if let Ok(inside) = real_directory.strip_prefix(&real_worktree_root) {
             return Ok(worktree_root.join(inside));
         }
-        // The worktree is a folder inside the repository.
-        if let Ok(inside) = real_worktree_root.strip_prefix(&real_top_level) {
+        // The worktree is a folder inside the folder.
+        if let Ok(inside) = real_worktree_root.strip_prefix(&real_directory) {
             let depth = inside.components().count();
             if let Some(root) = worktree_root.ancestors().nth(depth) {
                 return Ok(root.to_path_buf());
             }
         }
     }
-    Ok(top_level)
-}
-
-async fn resolve_tree(repo_root: &Path, base: &str) -> Result<String> {
-    git_line(
-        repo_root,
-        &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
-    )
-    .await
-}
-
-/// Writes the working tree, including untracked files that are not ignored, as a git
-/// tree object. A temporary index is used, so the repository's index is left untouched.
-async fn snapshot_tree(repo_root: &Path) -> Result<String> {
-    static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
-    let index_file = std::env::temp_dir().join(format!(
-        "zed-external-review-{}-{}.index",
-        std::process::id(),
-        NEXT_INDEX.fetch_add(1, Ordering::Relaxed)
-    ));
-    // Starting from a copy of the real index keeps its file stat cache, so unchanged
-    // files are not hashed again.
-    let real_index =
-        repo_root.join(git_line(repo_root, &["rev-parse", "--git-path", "index"]).await?);
-    if real_index.exists() {
-        std::fs::copy(&real_index, &index_file)?;
-    }
-    let tree = async {
-        git(repo_root, &["add", "--all"], Some(&index_file)).await?;
-        let tree = git(repo_root, &["write-tree"], Some(&index_file)).await?;
-        anyhow::Ok(String::from_utf8(tree)?.trim().to_string())
-    }
-    .await;
-    std::fs::remove_file(&index_file).ok();
-    tree
-}
-
-/// Paths, relative to the repository root, of files that were added or modified since `base`.
-async fn changed_paths(repo_root: &Path, base: &str) -> Result<Vec<String>> {
-    let current = snapshot_tree(repo_root).await?;
-    if current == base {
-        return Ok(Vec::new());
-    }
-    let output = git(
-        repo_root,
-        &[
-            "diff",
-            "--name-status",
-            "-z",
-            "--no-renames",
-            base,
-            &current,
-        ],
-        None,
-    )
-    .await?;
-    let output = String::from_utf8(output)?;
-    let mut fields = output.split('\0').filter(|field| !field.is_empty());
-    let mut paths = Vec::new();
-    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        if status != "D" {
-            paths.push(path.to_string());
-        }
-    }
-    Ok(paths)
-}
-
-/// The text of `repo_path` in `base`, or `None` if the file did not exist there.
-async fn base_text(repo_root: &Path, base: &str, repo_path: &str) -> Result<Option<String>> {
-    let object = format!("{base}:{repo_path}");
-    if git(repo_root, &["cat-file", "-e", &object], None)
-        .await
-        .is_err()
-    {
-        return Ok(None);
-    }
-    let blob = git(repo_root, &["cat-file", "blob", &object], None).await?;
-    let mut text = String::from_utf8(blob).context("file in the review base is not UTF-8")?;
-    LineEnding::normalize(&mut text);
-    Ok(Some(text))
+    Ok(directory.to_path_buf())
 }

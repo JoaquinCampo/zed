@@ -1699,7 +1699,12 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     })));
                 });
             }
-            OpenRequestKind::ExternalReview { enable, open, base } => {
+            OpenRequestKind::ExternalReview {
+                enable,
+                open,
+                fresh,
+                base,
+            } => {
                 let mut base_open_options = zed::open_options_for_request(
                     request.open_behavior,
                     &workspace::SerializedWorkspaceLocation::Local,
@@ -1730,6 +1735,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                 project,
                                 review_path,
                                 base,
+                                fresh,
                                 cx,
                             ))
                         } else {
